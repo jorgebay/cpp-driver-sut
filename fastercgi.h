@@ -77,6 +77,10 @@ typedef struct fcgi_connection_s {
   struct fcgi_server_s* serv;
   struct fcgi_connection_s* next_in_list;
 
+  bool in_free_list;
+  bool in_use;
+  bool is_closed;
+
   uv_pipe_t pipe;
   uv_async_t async;
 

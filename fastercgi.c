@@ -23,7 +23,6 @@
 #define FCGI_STATE_STDIN  4
 #define FCGI_STATE_WRITE  5
 #define FCGI_STATE_NOTIFY 6
-#define FCGI_STATE_END    7
 
 #define FCGI_WRITE_STATE_DATA_SENT 1
 #define FCGI_WRITE_STATE_EOS_SENT  2
@@ -40,11 +39,12 @@ static void fcgi__on_write(uv_write_t* write, int status);
 static void fcgi__on_write_end(uv_write_t* write, int status);
 
 static void fcgi__buffer_init(fcgi_buffer_t* buf);
+static void fcgi__connection_close(fcgi_connection_t* conn);
 static void fcgi__connection_init(fcgi_connection_t* conn, fcgi_server_t* serv);
 static void fcgi__connection_reset(fcgi_connection_t* conn);
 static fcgi_connection_t* fcgi__server_get_connection(fcgi_server_t* serv);
-static void fcgi__write_req_init(fcgi_write_req_t* req, fcgi_connection_t* conn, int type);
-static void fcgi__write_req_reset(fcgi_write_req_t* req, int type);
+static void fcgi__write_req_init(fcgi_write_req_t* req, fcgi_connection_t* conn);
+static void fcgi__write_req_reset(fcgi_write_req_t* req);
 
 /*****************************************************************************/
 
@@ -79,6 +79,8 @@ void fcgi__on_connection(uv_stream_t* stream, int status) {
   uv_pipe_init(stream->loop, &conn->pipe, 0);
 
   if (uv_accept(stream, (uv_stream_t*)&conn->pipe) == 0) {
+    conn->is_closed = false;
+    conn->in_use = true;
     uv_read_start((uv_stream_t*)&conn->pipe, fcgi__on_alloc, fcgi__on_read);
   } else {
     uv_close((uv_handle_t*)&conn->pipe, fcgi__on_close);
@@ -87,17 +89,17 @@ void fcgi__on_connection(uv_stream_t* stream, int status) {
 
 void fcgi__on_close(uv_handle_t* handle) {
   fcgi_connection_t* conn = (fcgi_connection_t*)handle->data;
-  fcgi__connection_reset(conn);
-  conn->next_in_list = conn->serv->free_list;
-  conn->serv->free_list = conn;
-
+  conn->is_closed = true;
+  if (!conn->in_use && !conn->in_free_list) {
+    fcgi__connection_reset(conn);
+  }
 }
 
 void fcgi__on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   fcgi_connection_t* conn = (fcgi_connection_t*)stream->data;
 
-  if (nread <= 0) {
-    uv_close((uv_handle_t*)&conn->pipe, fcgi__on_close);
+  if (nread < 0) {
+    fcgi__connection_close(conn);
     return;
   }
 
@@ -174,7 +176,7 @@ void fcgi__on_read(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         case FCGI_ABORT_REQUEST:
           //printf("abort request\n");
           conn->serv->handler_cb(conn, FCGI_STATE_ABORT);
-          uv_close((uv_handle_t*)&conn->pipe, fcgi__on_close);
+          fcgi__connection_close(conn);
           break;
 
         case FCGI_PARAMS:
@@ -218,12 +220,12 @@ void fcgi__on_write(uv_write_t* write, int status) {
 
 void fcgi__on_write_end(uv_write_t* write, int status) {
   fcgi_write_req_t* req = (fcgi_write_req_t*)write->data;
-  req->next_in_list = req->conn->free_list;
-  req->conn->free_list = req;
+  fcgi__write_req_reset(req);
   req->conn->serv->handler_cb(req->conn, FCGI_STATE_WRITE);
 }
 
 /*****************************************************************************/
+
 
 void fcgi__buffer_init(fcgi_buffer_t* buf) {
   buf->capacity = 0;
@@ -232,9 +234,21 @@ void fcgi__buffer_init(fcgi_buffer_t* buf) {
   buf->data = NULL;
 }
 
+void fcgi__connection_close(fcgi_connection_t* conn) {
+  if (!uv_is_closing((uv_handle_t*)&conn->pipe)) {
+    uv_close((uv_handle_t*)&conn->pipe, fcgi__on_close);
+  }
+}
+
 void fcgi__connection_init(fcgi_connection_t* conn, fcgi_server_t* serv) {
   conn->serv = serv;
-  conn->next_in_list = NULL;
+
+  conn->next_in_list = conn->serv->free_list;
+  conn->serv->free_list = conn;
+
+  conn->in_free_list = true;
+  conn->in_use = false;
+  conn->is_closed = true;
 
   conn->data = NULL;
 
@@ -266,6 +280,11 @@ void fcgi__connection_init(fcgi_connection_t* conn, fcgi_server_t* serv) {
 }
 
 void fcgi__connection_reset(fcgi_connection_t* conn) {
+  conn->next_in_list = conn->serv->free_list;
+  conn->serv->free_list = conn;
+
+  conn->in_free_list = true;
+
   fcgi_buffer_reset(&conn->incoming_buf);
 
   conn->record_state = 0;
@@ -288,20 +307,27 @@ fcgi_connection_t* fcgi__server_get_connection(fcgi_server_t* serv) {
   fcgi_connection_t* conn = serv->free_list;
   if (conn) {
     serv->free_list = conn->next_in_list;
+    conn->in_free_list = false;
   }
   return conn;
 }
 
-void fcgi__write_req_init(fcgi_write_req_t* req, fcgi_connection_t* conn, int type) {
+void fcgi__write_req_init(fcgi_write_req_t* req, fcgi_connection_t* conn) {
   req->conn = conn;
-  req->next_in_list = NULL;
-  req->type = type;
-  req->req.data = req;
+  req->next_in_list = req->conn->free_list;
+  req->conn->free_list = req;
+
+  req->type = 0;
   fcgi__buffer_init(&req->outgoing_buf);
+
+  req->req.data = req;
 }
 
-void fcgi__write_req_reset(fcgi_write_req_t* req, int type) {
-  req->type = type;
+void fcgi__write_req_reset(fcgi_write_req_t* req) {
+  req->next_in_list = req->conn->free_list;
+  req->conn->free_list = req;
+
+  req->type = 0;
   fcgi_buffer_reset(&req->outgoing_buf);
 }
 
@@ -383,17 +409,25 @@ fcgi_write_req_t* fcgi_connection_get_write_request(fcgi_connection_t* conn, int
   fcgi_write_req_t* req = conn->free_list;
   if (req) {
     conn->free_list = req->next_in_list;
-    fcgi__write_req_reset(req, type);
   } else {
     req = (fcgi_write_req_t*)malloc(sizeof(fcgi_write_req_t));
-    fcgi__write_req_init(req, conn, type);
+    fcgi__write_req_init(req, conn);
   }
+  req->type = type;
   return req;
 }
 
 void fcgi_write_request_send(fcgi_write_req_t* req) {
   char* to_write = req->to_write;
   fcgi_buffer_t* buf = &req->outgoing_buf;
+
+  if (req->conn->is_closed) {
+    if (!req->conn->in_free_list) {
+      fcgi__connection_reset(req->conn);
+    }
+    fcgi__write_req_reset(req);
+    return;
+  }
 
   size_t remaining = buf->length - buf->position;
   if (remaining > 0) {
@@ -411,7 +445,11 @@ void fcgi_write_request_send(fcgi_write_req_t* req) {
     buf->position += to_copy;
 
     uv_buf_t uvbuf = uv_buf_init(to_write, FCGI_RECORD_HEADER_LENGTH + to_copy);
-    uv_write(&req->req, (uv_stream_t*)&req->conn->pipe, &uvbuf, 1, fcgi__on_write);
+    int rc = uv_write(&req->req, (uv_stream_t*)&req->conn->pipe, &uvbuf, 1, fcgi__on_write);
+    if (rc != 0) {
+      fprintf(stderr, "Write error %s\n", uv_strerror(rc));
+      fcgi__write_req_reset(req);
+    }
   } else if(req->type == FCGI_STDOUT || req->type == FCGI_STDOUT) {
     to_write[0] = req->conn->version;
     to_write[1] = req->type;
@@ -422,14 +460,16 @@ void fcgi_write_request_send(fcgi_write_req_t* req) {
     to_write[6] = 0;
 
     uv_buf_t uvbuf = uv_buf_init(to_write, FCGI_RECORD_HEADER_LENGTH);
-    uv_write(&req->req, (uv_stream_t*)&req->conn->pipe, &uvbuf, 1, fcgi__on_write_end);
-  } else if (req->type == FCGI_END_REQUEST) {
-    req->next_in_list = req->conn->free_list;
-    req->conn->free_list = req;
-    req->conn->serv->handler_cb(req->conn, FCGI_STATE_END);
-    if ((req->conn->flags & FCGI_KEEP_CONN) == 0) {
-      uv_close((uv_handle_t*)&req->conn->pipe, fcgi__on_close);
+    int rc = uv_write(&req->req, (uv_stream_t*)&req->conn->pipe, &uvbuf, 1, fcgi__on_write_end);
+    if (rc != 0) {
+      fprintf(stderr, "Write error %s\n", uv_strerror(rc));
+      fcgi__write_req_reset(req);
     }
+  } else if (req->type == FCGI_END_REQUEST) {
+    fcgi__write_req_reset(req);
+    if ((req->conn->flags & FCGI_KEEP_CONN) == 0) {
+      fcgi__connection_close(req->conn);
+    } 
   }
 }
 
@@ -439,6 +479,8 @@ void fcgi_connection_notify(fcgi_connection_t* conn) {
 
 void fcgi_connection_end(fcgi_connection_t* conn) {
   char to_write[FCGI_END_REQUEST_LENGTH];
+
+  conn->in_use = false;
 
   fcgi_write_req_t* req = fcgi_connection_get_write_request(conn, FCGI_END_REQUEST);
 
@@ -467,8 +509,6 @@ int fcgi_server_init(fcgi_server_t* serv) {
   for (i = 0; i < FCGI_MAX_CONNECTIONS; ++i) {
     fcgi_connection_t* conn = &serv->conns[i];
     fcgi__connection_init(conn, serv);
-    conn->next_in_list = serv->free_list;
-    serv->free_list = conn;
   }
 
   return 0;
